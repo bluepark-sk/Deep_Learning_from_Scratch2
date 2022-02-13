@@ -1,4 +1,4 @@
-# 2.4.1. 상호정보량
+# 2.4.1 상호정보량
 import numpy as np
 
 def ppmi(C, verbose=False, eps=1e-8):
