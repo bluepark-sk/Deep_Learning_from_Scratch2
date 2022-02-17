@@ -19,7 +19,7 @@ class RNN:
         Wx, Wh, b = self.params
         x, h_prev, h_next = self.cache
 
-        dt = dh_next * (1 - dh_next ** 2)
+        dt = dh_next * (1 - h_next ** 2)
         db = np.sum(dt, axis=0)
         dWh = np.matmul(h_prev.T, dt)
         dh_prev = np.matmul(dt, Wh.T)
