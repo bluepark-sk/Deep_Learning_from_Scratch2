@@ -1,5 +1,6 @@
 import numpy as np
 import pickle
+from common.base_model import BaseModel
 from common.layers import Embedding, LSTM, Affine
 
 # TimeEmbedding 계층 (내가 직접 짠거)
@@ -329,3 +330,210 @@ class BetterRnnlm:
     def load_params(self, file_name='better_Rnnlm.pkl'):
         with open(file_name, 'rb') as f:
             self.params = pickle.load(f)
+
+class Encoder:
+    def __init__(self, vocab_size, wordvec_size, hidden_size):
+        V, D, H = vocab_size, wordvec_size, hidden_size
+        rn = np.random.randn
+
+        embed_W = (rn(V, D) / 100).astype('f')
+        lstm_Wx = (rn(D, 4*H) / np.sqrt(D)).astype('f')
+        lstm_Wh = (rn(H, 4*H) / np.sqrt(H)).astype('f')
+        lstm_b = np.zeros(4*H).astype('f')
+
+        self.embed = TimeEmbedding(embed_W)
+        self.lstm = TimeLSTM(lstm_Wx, lstm_Wh, lstm_b, stateful=False)
+
+        self.params = self.embed.params + self.lstm.params
+        self.grads = self.embed.grads + self.lstm.grads
+        self.hs = None
+    
+    def forward(self, xs):
+        xs = self.embed.forward(xs)
+        hs = self.lstm.forward(xs)
+        self.hs = hs
+        return hs[:, -1, :] # TimeLSTM 계층의 마지막 은닉 상태 출력
+    
+    def backward(self, dh):
+        dhs = np.zeros_like(self.hs)
+        dhs[:, -1, :] = dh
+
+        dout = self.lstm.backward(dhs)
+        dout = self.embed.backward(dout)
+
+        return dout
+
+class Decoder:
+    def __init__(self, vocab_size, wordvec_size, hidden_size):
+        V, D, H = vocab_size, wordvec_size, hidden_size
+        rn = np.random.randn
+
+        embed_W = (rn(V, D) / 100).astype('f')
+        lstm_Wx = (rn(D, 4*H) / np.sqrt(D)).astype('f')
+        lstm_Wh = (rn(H, 4*H) / np.sqrt(H)).astype('f')
+        lstm_b = np.zeros(4*H).astype('f')
+        affine_W = (rn(H, V) / np.sqrt(H)).astype('f')
+        affine_b = np.zeros(V).astype('f')
+
+        self.embed = TimeEmbedding(embed_W)
+        self.lstm = TimeLSTM(lstm_Wx, lstm_Wh, lstm_b, stateful=True)
+        self.affine = TimeAffine(affine_W, affine_b)
+
+        self.params, self.grads = [], []
+        for layer in (self.embed, self.lstm, self.affine):
+            self.params += layer.params
+            self.grads += layer.grads
+        
+    def forward(self, xs, h):
+        self.lstm.set_state(h)
+
+        out = self.embed.forward(xs)
+        out = self.lstm.forward(out)
+        score = self.affine.forward(out)
+        
+        return score
+    
+    def backward(self, dscore):
+        dout = self.affine.backward(dscore)
+        dout = self.lstm.backward(dout)
+        dout = self.embed.backward(dout)
+        dh = self.lstm.dh
+        return dh
+    
+    def generate(self, h, start_id, sample_size):
+        sampled = []
+        sample_id = start_id
+        self.lstm.set_state(h)
+
+        for _ in range(sample_size):
+            x = np.array(sample_id).reshape((1, 1))
+            out = self.embed.forward(x)
+            out = self.lstm.forward(out)
+            score = self.affine.forward(out)
+
+            sample_id = np.argmax(score.flatten())
+            sampled.append(int(sample_id))
+        
+        return sampled
+
+class Seq2seq(BaseModel):
+    def __init__(self, vocab_size, wordvec_size, hidden_size):
+        V, D, H = vocab_size, wordvec_size, hidden_size
+        self.encoder = Encoder(V, D, H)
+        self.decoder = Decoder(V, D, H)
+        self.softmax = TimeSoftmaxWithLoss()
+
+        self.params = self.encoder.params + self.decoder.params
+        self.grads = self.encoder.grads + self.decoder.grads
+
+    def forward(self, xs, ts):
+        decoder_xs, decoder_ts = ts[:, :-1], ts[:, 1:]
+        h = self.encoder.forward(xs)
+        score = self.decoder.forward(decoder_xs, h)
+        loss = self.softmax.forward(score, decoder_ts)
+        return loss
+    
+    def backward(self, dout=1):
+        dscore = self.softmax.backward(dout)
+        dh = self.decoder.backward(dscore)
+        dout = self.encoder.backward(dh)
+        return dout
+    
+    def generate(self, xs, start_id, sample_size):
+        h = self.encoder.forward(xs)
+        sampled = self.decoder.generate(h, start_id, sample_size)
+        return sampled
+
+class PeekyDecoder:
+    def __init__(self, vocab_size, wordvec_size, hidden_size):
+        V, D, H = vocab_size, wordvec_size, hidden_size
+        rn = np.random.randn
+        
+        embed_W = (rn(V, D) / 100).astype('f')
+        lstm_Wx = (rn(H+D, 4*H) / np.sqrt(H+D)).astype('f') # peeky
+        lstm_Wh = (rn(H, 4*H) / np.sqrt(H)).astype('f')
+        lstm_b = np.zeros(4*H).astype('f')
+        affine_W = (rn(H+H, V) / np.sqrt(H+H)).astype('f') # peeky
+        affine_b = np.zeros(V).astype('f')
+        
+        self.embed = TimeEmbedding(embed_W)
+        self.lstm = TimeLSTM(lstm_Wx, lstm_Wh, lstm_b, stateful=True)
+        self.affine = TimeAffine(affine_W, affine_b)
+
+        self.params, self.grads = [], []
+        for layer in (self.embed, self.lstm, self.affine):
+            self.params += layer.params
+            self.grads += layer.grads
+        
+        self.cache = None
+    
+    def forward(self, xs, h):
+        self.lstm.set_state(h)
+
+        N, T = xs.shape
+        N, H = h.shape
+
+        xs = self.embed.forward(xs) # xs shape : (N, T, D)
+
+        hs = np.repeat(h, T, axis=0).reshape(N, T, H) # hs shape : (N, T, H)
+        out = np.concatenate((hs, xs), axis=2) # out shape : (N, T, H+D)
+        out = self.lstm.forward(out) # out shape : (N, T, H)
+
+        out = np.concatenate((hs, out), axis=2) # out shape : (N, T, H+H)
+        score = self.affine.forward(out) # score shape : (N, T, V)
+
+        self.cache = H
+
+        return score
+    
+    def backward(self, dscore):
+        H = self.cache
+
+        dout = self.affine.backward(dscore) # dout shape : (N, T, H+H)
+        dh_affine, dout = np.split(dout, [H], axis=2) # dh_affine shape : (N, T, H) / dout shape : (N, T, H)
+        dh_affine = np.sum(dh_affine, axis=1) # dh_affine shape : (N, H)
+        
+        dout = self.lstm.backward(dout) # dout shape : (N, T, H+D)
+        dh_lstm, dout = np.split(dout, [H], axis=2) # dh_lstm shape : (N, T, H) / dout shape : (N, T, D)
+        dh_lstm = np.sum(dh_lstm, axis=1) # dh_lstm shape : (N, H)
+
+        dh = self.lstm.dh # dh shape : (N, H)
+
+        dh = dh_affine + dh_lstm + dh # dh shape : (N, H)
+
+        return dh
+    
+    def generate(self, h, start_id, sample_size):
+        sampled = []
+        char_id = start_id
+        self.lstm.set_state(h)
+
+        H = h.shape[1] # h shape : (N, H) = (1, H)
+        peeky_h = h.reshape(1, 1, H) # peeky_h shape : (1, 1, H)
+        for _ in range(sample_size):
+            x = np.array([char_id]).reshape((1, 1)) # x shape : (N, T) = (1, 1)
+            out = self.embed.forward(x) # out shape : (N, T, D) = (1, 1, D)
+
+            out = np.concatenate((peeky_h, out), axis=2) # out shape : (N, T, H+D) = (1, 1, H+D)
+            out = self.lstm.forward(out) # out shape : (N, T, H) = (1, 1, H)
+
+            out = np.concatenate((peeky_h, out), axis=2) # out shape : (N, T, H+H) = (1, 1, H+H)
+            score = self.affine.forward(out) # out shape : (N, T, V) = (1, 1, V)
+
+            sample_id = np.argmax(score.flatten())
+            sampled.append(int(sample_id))
+        
+        return sampled
+
+class PeekySeq2seq(Seq2seq):
+    def __init__(self, vocab_size, wordvec_size, hidden_size):
+        super().__init__(vocab_size, wordvec_size, hidden_size)
+        
+        V, D, H = vocab_size, wordvec_size, hidden_size
+
+        self.encoder = Encoder(V, D, H)
+        self.decoder = PeekyDecoder(V, D, H)
+        self.softmax = TimeSoftmaxWithLoss()
+
+        self.params = self.encoder.params + self.decoder.params
+        self.grads = self.encoder.grads + self.decoder.grads
